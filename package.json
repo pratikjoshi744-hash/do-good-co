@@ -1,0 +1,16 @@
+{
+  "name": "do-good-co-server",
+  "version": "1.0.0",
+  "description": "Do Good Co. MVP API. Zero external dependencies by design (Node 22 built-ins only: node:http, node:sqlite) so it runs anywhere with just `node`. Real REST endpoints backed by a real SQLite database, seeded with demo data. Swap the query layer in src/db for a hosted Postgres/Supabase later without changing the API contract routes rely on.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node src/db/seed.js"
+  },
+  "dependencies": {}
+}
