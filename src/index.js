@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { URL } from 'node:url';
-import { seedIfEmpty, backfillMissingMedia, backfillReferralCodes, regenerateMediaIfStale, backfillSkillTags } from './db/seed.js';
+import { seedIfEmpty, backfillMissingMedia, backfillReferralCodes, regenerateMediaIfStale, backfillSkillTags, backfillKarmaCards } from './db/seed.js';
 import { Router, ok, fail } from './lib/http.js';
 
 import authRoutes from './routes/auth.js';
@@ -28,6 +28,10 @@ import aiRoutes from './routes/ai.js';
 import institutionRoutes from './routes/institutions.js';
 import passportRoutes from './routes/passport.js';
 import shareRoutes from './routes/share.js';
+import relayRoutes from './routes/relays.js';
+import cardRoutes from './routes/cards.js';
+import radarRoutes from './routes/radar.js';
+import civicRoutes from './routes/civic.js';
 
 const PORT = process.env.PORT || 4000;
 
@@ -74,8 +78,13 @@ if (skillTagBackfill.backfilled > 0) {
   console.log(`Backfilled skill tags onto ${skillTagBackfill.backfilled} existing quest(s).`);
 }
 
+const cardBackfill = backfillKarmaCards();
+if (cardBackfill.backfilled > 0) {
+  console.log(`Seeded ${cardBackfill.backfilled} Karma Card(s) into the collectible catalog.`);
+}
+
 const router = new Router();
-[authRoutes, categoryRoutes, questRoutes, leaderboardRoutes, walletRoutes, profileRoutes, moderationRoutes, csrRoutes, ngoRoutes, messageRoutes, townRoutes, mapRoutes, rivalRoutes, bossQuestRoutes, searchRoutes, inviteRoutes, karmaMatchRoutes, arcadeRoutes, socialRoutes, campaignRoutes, paymentRoutes, aiRoutes, institutionRoutes, passportRoutes, shareRoutes].forEach((r) => {
+[authRoutes, categoryRoutes, questRoutes, leaderboardRoutes, walletRoutes, profileRoutes, moderationRoutes, csrRoutes, ngoRoutes, messageRoutes, townRoutes, mapRoutes, rivalRoutes, bossQuestRoutes, searchRoutes, inviteRoutes, karmaMatchRoutes, arcadeRoutes, socialRoutes, campaignRoutes, paymentRoutes, aiRoutes, institutionRoutes, passportRoutes, shareRoutes, relayRoutes, cardRoutes, radarRoutes, civicRoutes].forEach((r) => {
   router.routes.push(...r.routes);
 });
 
