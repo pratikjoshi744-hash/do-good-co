@@ -29,6 +29,8 @@ const COLUMN_MIGRATIONS = {
     ['site_lat', "REAL"],
     ['site_lng', "REAL"],
     ['skill_tags', "TEXT NOT NULL DEFAULT ''"],
+    ['relay_chain_id', "TEXT REFERENCES relay_chains(id)"],
+    ['is_civic', "INTEGER NOT NULL DEFAULT 0"],
   ],
   proofs: [
     ['media_type', "TEXT"],
@@ -39,6 +41,8 @@ const COLUMN_MIGRATIONS = {
     ['ai_flag_reason', "TEXT"],
     ['distance_meters', "REAL"],
     ['witness_count', "INTEGER NOT NULL DEFAULT 0"],
+    ['voice_note_data', "TEXT"],
+    ['ai_vision_score', "INTEGER"],
   ],
   companies: [
     // Paise matched per hour of verified volunteering by an employee — the
@@ -430,6 +434,77 @@ export function initSchema() {
       requested_at TEXT NOT NULL DEFAULT (datetime('now')),
       confirmed_at TEXT
     );
+
+    -- Karma Coins → UPI cashout REQUESTS. This is deliberately a request/
+    -- ledger/admin-approval flow, not an automatic bank transfer: coins are
+    -- deducted (held) the moment a request is filed, an admin reviews it in
+    -- the moderation queue, and marks it 'paid' once the actual UPI transfer
+    -- has been sent manually outside the app (same pattern any early-stage
+    -- fintech MVP uses before wiring a payout API/partner bank account).
+    -- Rejected requests refund the held coins.
+    CREATE TABLE IF NOT EXISTS cashout_requests (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      coins INTEGER NOT NULL,
+      amount_paise INTEGER NOT NULL,
+      upi_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      admin_note TEXT,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      processed_at TEXT
+    );
+
+    -- Deed relays: a multi-person chained quest where step 2 only unlocks
+    -- once step 1 is done, etc. — a relay baton, not a solo checklist.
+    CREATE TABLE IF NOT EXISTS relay_chains (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      icon TEXT NOT NULL DEFAULT '🔗',
+      category_id TEXT REFERENCES categories(id),
+      creator_id TEXT NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- proof_caption/proof_media_* store each leg's evidence directly (rather
+    -- than reusing the proofs table, whose quest_id is NOT NULL and whose
+    -- whole schema is shaped around the AI-screen/upvote review pipeline
+    -- that a lightweight, social-trust relay leg deliberately skips).
+    CREATE TABLE IF NOT EXISTS relay_steps (
+      id TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL REFERENCES relay_chains(id) ON DELETE CASCADE,
+      step_order INTEGER NOT NULL,
+      task TEXT NOT NULL,
+      assignee_id TEXT REFERENCES users(id),
+      proof_caption TEXT,
+      proof_media_type TEXT,
+      proof_media_data TEXT,
+      status TEXT NOT NULL DEFAULT 'locked',
+      claimed_at TEXT,
+      completed_at TEXT,
+      UNIQUE(chain_id, step_order)
+    );
+
+    -- Collectible Karma Cards — a milestone deed can drop a random card,
+    -- weighted by rarity. user_cards is the per-user collection; cards can
+    -- be gifted (row's user_id changes, gifted_from records provenance).
+    CREATE TABLE IF NOT EXISTS karma_cards (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      rarity TEXT NOT NULL DEFAULT 'common',
+      art TEXT NOT NULL DEFAULT '🃏',
+      description TEXT NOT NULL,
+      color TEXT NOT NULL DEFAULT '#8B5CF6'
+    );
+
+    CREATE TABLE IF NOT EXISTS user_cards (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      card_id TEXT NOT NULL REFERENCES karma_cards(id),
+      obtained_at TEXT NOT NULL DEFAULT (datetime('now')),
+      gifted_from TEXT REFERENCES users(id)
+    );
   `);
 
   // Backfill columns onto tables that already existed before those columns
@@ -470,5 +545,12 @@ export function initSchema() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_institutions_join_code ON institutions(join_code);
     CREATE INDEX IF NOT EXISTS idx_csr_matches_company ON csr_matches(company_id);
     CREATE INDEX IF NOT EXISTS idx_csr_matches_user ON csr_matches(user_id);
+    CREATE INDEX IF NOT EXISTS idx_cashout_user ON cashout_requests(user_id);
+    CREATE INDEX IF NOT EXISTS idx_cashout_status ON cashout_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_relay_steps_chain ON relay_steps(chain_id);
+    CREATE INDEX IF NOT EXISTS idx_relay_steps_assignee ON relay_steps(assignee_id);
+    CREATE INDEX IF NOT EXISTS idx_quests_relay_chain ON quests(relay_chain_id);
+    CREATE INDEX IF NOT EXISTS idx_user_cards_user ON user_cards(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_cards_card ON user_cards(card_id);
   `);
 }

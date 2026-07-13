@@ -1041,3 +1041,40 @@ export function backfillSkillTags() {
   }
   return { backfilled: missing.length };
 }
+
+// Karma Cards — the fixed collectible catalog. Fixed IDs so re-running this
+// on a database that already has the catalog is a safe no-op (INSERT OR
+// IGNORE), same idempotent-backfill pattern as the rest of this file.
+export const KARMA_CARD_CATALOG = [
+  { id: 'card-sapling', name: 'Sapling Starter', rarity: 'common', art: '🌱', color: '#34D399', description: 'Your first deed — every legend starts here.' },
+  { id: 'card-broom', name: 'Clean Sweep', rarity: 'common', art: '🧹', color: '#38BDF8', description: 'Left a place better than you found it.' },
+  { id: 'card-meal', name: 'Meal Mover', rarity: 'common', art: '🥘', color: '#FB923C', description: 'Got food to someone who needed it.' },
+  { id: 'card-paw', name: 'Paw Friend', rarity: 'common', art: '🐾', color: '#A78BFA', description: 'Looked out for the city\'s strays.' },
+  { id: 'card-lesson', name: 'First Lesson', rarity: 'common', art: '📚', color: '#F472B6', description: 'Taught someone something that mattered.' },
+  { id: 'card-river', name: 'River Guardian', rarity: 'rare', art: '🌊', color: '#22D3EE', description: 'Fought for cleaner water, one deed at a time.' },
+  { id: 'card-firstaid', name: 'First Responder', rarity: 'rare', art: '🩹', color: '#F87171', description: 'Showed up when someone needed care.' },
+  { id: 'card-culture', name: 'Culture Keeper', rarity: 'rare', art: '🎨', color: '#FBBF24', description: 'Kept a tradition or an art form alive.' },
+  { id: 'card-civic', name: 'Civic Champion', rarity: 'epic', art: '🏛️', color: '#818CF8', description: 'Did the unglamorous public-good work.' },
+  { id: 'card-streak', name: 'Streak Master', rarity: 'epic', art: '🔥', color: '#FB7185', description: 'Showed up for your city, day after day.' },
+  { id: 'card-legend', name: 'Karma Legend', rarity: 'legendary', art: '👑', color: '#FDE047', description: 'A verified, community-witnessed force for good.' },
+];
+
+const CARD_RARITY_WEIGHTS = { common: 60, rare: 25, epic: 12, legendary: 3 };
+
+export function backfillKarmaCards() {
+  initSchema();
+  const insert = db.prepare(`INSERT OR IGNORE INTO karma_cards (id, name, rarity, art, description, color) VALUES (@id, @name, @rarity, @art, @description, @color)`);
+  let backfilled = 0;
+  for (const card of KARMA_CARD_CATALOG) {
+    const result = insert.run(card);
+    if (result.changes > 0) backfilled++;
+  }
+  return { backfilled };
+}
+
+export function pickWeightedCard() {
+  const cards = db.prepare('SELECT * FROM karma_cards').all();
+  if (cards.length === 0) return null;
+  const pool = cards.flatMap((c) => Array(CARD_RARITY_WEIGHTS[c.rarity] || 10).fill(c));
+  return pool[Math.floor(Math.random() * pool.length)];
+}
