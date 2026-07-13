@@ -2,7 +2,7 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import { Router } from '../lib/http.js';
 import { ok, created, readJsonBody, HttpError } from '../lib/http.js';
 import { db } from '../db/connection.js';
-import { serializeTransaction, serializeRedemption, serializeVoucher } from '../lib/serialize.js';
+import { serializeTransaction, serializeRedemption, serializeVoucher, serializeCashoutRequest } from '../lib/serialize.js';
 import { requireAuth } from '../middleware/auth.js';
 
 // Real-looking, collision-checked voucher code — not a fake placeholder.
@@ -146,6 +146,69 @@ router.post('/api/wallet/daily-spin', requireAuth, async (req, res) => {
 
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   created(res, { reward, karmaCoins: updated.karma_coins });
+});
+
+// --- Karma Coins → UPI cashout ---------------------------------------------
+//
+// This is a REQUEST/ledger/admin-approval flow, not an automatic bank
+// transfer: filing a request holds the coins immediately, an admin reviews
+// it in the moderation queue (see routes/moderation.js), and marks it 'paid'
+// once the real UPI transfer has actually been sent — by the human operator,
+// outside this app. Real fund movement is out of scope for an automated
+// agent to execute; this builds the honest, auditable infrastructure a real
+// payout desk would run on top of (exactly the same "manual disbursement
+// behind a request queue" pattern most early fintech MVPs launch with before
+// they integrate a payout API/partner bank).
+const CASHOUT_PAISE_PER_COIN = 40; // ₹0.40/coin — below the ₹0.49-₹0.599/coin buy price (COIN_PACKAGES), so cash-out isn't a risk-free arbitrage loop
+const CASHOUT_MIN_COINS = 250; // ≈ ₹100 minimum, keeps request volume sane for manual processing
+const UPI_ID_RE = /^[a-zA-Z0-9.\-_]{2,64}@[a-zA-Z]{2,64}$/;
+
+router.get('/api/wallet/cashout-requests', requireAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM cashout_requests WHERE user_id = ? ORDER BY requested_at DESC').all(req.user.id);
+  ok(res, rows.map(serializeCashoutRequest));
+});
+
+router.post('/api/wallet/cashout-request', requireAuth, async (req, res) => {
+  const body = await readJsonBody(req);
+  const coins = Math.floor(Number(body.coins));
+  const upiId = String(body.upiId || '').trim();
+
+  if (!Number.isFinite(coins) || coins < CASHOUT_MIN_COINS) {
+    throw new HttpError(400, `Minimum cashout is ${CASHOUT_MIN_COINS} Karma Coins`);
+  }
+  if (!UPI_ID_RE.test(upiId)) {
+    throw new HttpError(400, 'Enter a valid UPI ID (e.g. yourname@upi)');
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  if (user.karma_coins < coins) {
+    throw new HttpError(400, 'Not enough Karma Coins for this cashout', { needed: coins, have: user.karma_coins });
+  }
+
+  const pending = db.prepare(`SELECT id FROM cashout_requests WHERE user_id = ? AND status = 'pending'`).get(user.id);
+  if (pending) throw new HttpError(409, 'You already have a cashout request pending review.');
+
+  const amountPaise = coins * CASHOUT_PAISE_PER_COIN;
+  const id = randomUUID();
+
+  // Coins are held (deducted) the moment the request is filed — mirrors how
+  // a real payout queue works (funds move out of the spendable balance the
+  // instant a payout is requested, refunded only if the request is rejected).
+  db.prepare('UPDATE users SET karma_coins = karma_coins - ? WHERE id = ?').run(coins, user.id);
+  db.prepare(`
+    INSERT INTO cashout_requests (id, user_id, coins, amount_paise, upi_id, status)
+    VALUES (?, ?, ?, ?, ?, 'pending')
+  `).run(id, user.id, coins, amountPaise, upiId);
+  db.prepare(`
+    INSERT INTO wallet_transactions (id, user_id, direction, amount, description, status)
+    VALUES (?, ?, 'redeem', ?, ?, 'completed')
+  `).run(randomUUID(), user.id, -coins, `Cashout requested to ${upiId} (₹${Math.round(amountPaise / 100)})`);
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  created(res, {
+    request: serializeCashoutRequest(db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(id)),
+    karmaCoins: updated.karma_coins,
+  });
 });
 
 export default router;

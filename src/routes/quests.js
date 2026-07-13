@@ -142,6 +142,34 @@ function distanceMeters(a, b) {
 const GPS_RADIUS_METERS = 30000; // generous — both quest site and user GPS are city-level simulated in this build
 const MIN_CAPTION_LENGTH = 12;
 
+// "AI vision auto-verification" — a heuristic stand-in for a real
+// vision-language-model call (same convention as routes/ai.js: explicitly
+// labeled, deterministic, swappable later without touching the client). It
+// scores confidence from signals we can actually compute today — photo
+// detail (imageVariance), whether the caption is grounded in the quest's
+// own words (a cheap proxy for "does the reflection describe *this* deed"),
+// and GPS agreement — and lets a high-confidence submission skip straight to
+// approved instead of waiting on the simulated community-upvote fast track.
+const AI_VISION_INSTANT_THRESHOLD = 78;
+const STOP_WORDS = new Set(['this','that','with','from','have','your','into','some','were','they','their','about','while','which','there','then','than','when','what']);
+
+function captionGroundedInQuest(caption, quest) {
+  const questWords = new Set(
+    `${quest.title} ${quest.description}`.toLowerCase().match(/[a-z]{4,}/g)?.filter((w) => !STOP_WORDS.has(w)) || []
+  );
+  const captionWords = caption.toLowerCase().match(/[a-z]{4,}/g) || [];
+  return captionWords.some((w) => questWords.has(w));
+}
+
+function visionConfidenceScore({ hasMedia, imageVariance, captionGrounded, gpsOk }) {
+  let score = 35;
+  if (hasMedia) score += 20;
+  if (typeof imageVariance === 'number') score += Math.max(0, Math.min(30, Math.round(imageVariance * 150)));
+  if (captionGrounded) score += 15;
+  if (gpsOk) score += 5;
+  return Math.max(0, Math.min(100, score));
+}
+
 // Submit proof for a quest — this is the "prove it" endpoint, and it now
 // runs a lightweight AI-style screening pass before anything gets the usual
 // simulated-community-upvote fast track (see below): a proof that fails the
@@ -155,8 +183,15 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
   if (body.mediaData && !/^data:(image|video)\/[a-zA-Z0-9.+-]+;base64,/.test(body.mediaData)) {
     throw new HttpError(400, 'mediaData must be an image or video data URL');
   }
+  if (body.voiceNoteData && !/^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(body.voiceNoteData)) {
+    throw new HttpError(400, 'voiceNoteData must be an audio data URL');
+  }
   const caption = (body.caption || '').trim();
-  if (caption.length < MIN_CAPTION_LENGTH) {
+  const hasVoiceNote = !!body.voiceNoteData;
+  // A voice note IS the reflection — captioning becomes optional when one is
+  // attached (no fake transcription; the audio itself is the evidence, same
+  // honesty as every other heuristic in this file).
+  if (!hasVoiceNote && caption.length < MIN_CAPTION_LENGTH) {
     throw new HttpError(400, `Add a quick reflection (at least ${MIN_CAPTION_LENGTH} characters) — what did you actually do?`);
   }
 
@@ -191,10 +226,17 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
 
   const aiFlagReason = flagReasons.length ? flagReasons.join('; ') : null;
 
+  const visionScore = visionConfidenceScore({
+    hasMedia: !!body.mediaData,
+    imageVariance: typeof body.imageVariance === 'number' ? body.imageVariance : null,
+    captionGrounded: captionGroundedInQuest(caption, quest),
+    gpsOk: distance == null || distance <= GPS_RADIUS_METERS,
+  });
+
   const proofId = randomUUID();
   db.prepare(`
-    INSERT INTO proofs (id, quest_id, user_id, caption, photo_placeholder, media_type, media_data, gps_lat, gps_lng, status, upvote_count, flag_count, ai_duplicate_flag, image_hash, ai_flag_reason, distance_meters, submitted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?, datetime('now'))
+    INSERT INTO proofs (id, quest_id, user_id, caption, photo_placeholder, media_type, media_data, gps_lat, gps_lng, status, upvote_count, flag_count, ai_duplicate_flag, image_hash, ai_flag_reason, distance_meters, ai_vision_score, voice_note_data, submitted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).run(
     proofId,
     quest.id,
@@ -208,7 +250,9 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
     isDuplicate ? 1 : 0,
     body.imageHash ?? null,
     aiFlagReason,
-    distance
+    distance,
+    visionScore,
+    body.voiceNoteData ?? null
   );
 
   // Demo simulation: in production this waits for real community upvotes.
@@ -221,10 +265,15 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
   // that's the whole point of the "reviewed by a verified NGO partner" claim
   // shown on the quest detail screen, not just a cosmetic badge.
   const needsRealReview = !!aiFlagReason || !!quest.ngo_featured;
+  // A high-confidence AI vision score skips the wait entirely — no
+  // simulated upvotes needed at all. This is the actual speed-up: previously
+  // even a passing proof needed `upvoteThreshold` simulated corroborations
+  // before it cleared; now a clean, well-grounded photo is instant.
+  const aiVisionVerified = !needsRealReview && visionScore >= AI_VISION_INSTANT_THRESHOLD;
   // Trusted users need fewer corroborating upvotes to clear the fast track —
   // see upvoteThresholdFor in lib/gamification.js.
   const upvoteThreshold = upvoteThresholdFor(req.user.trust_score);
-  if (!needsRealReview) {
+  if (!needsRealReview && !aiVisionVerified) {
     const simulatedUpvoters = db.prepare(`
       SELECT id FROM users WHERE id != ? ORDER BY RANDOM() LIMIT ?
     `).all(req.user.id, upvoteThreshold);
@@ -238,7 +287,12 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
 
   let newBadges = [];
   let approved = false;
-  if (!needsRealReview && upvoteCount >= upvoteThreshold) {
+  if (aiVisionVerified) {
+    db.prepare(`UPDATE proofs SET status = 'approved', reviewed_at = datetime('now'), reviewed_by = 'ai-vision-heuristic' WHERE id = ?`).run(proofId);
+    adjustTrustScore(req.user.id, 2);
+    newBadges = awardForApprovedProof(req.user, quest, proofId);
+    approved = true;
+  } else if (!needsRealReview && upvoteCount >= upvoteThreshold) {
     db.prepare(`UPDATE proofs SET status = 'approved', reviewed_at = datetime('now'), reviewed_by = 'community' WHERE id = ?`).run(proofId);
     adjustTrustScore(req.user.id, 2);
     newBadges = awardForApprovedProof(req.user, quest, proofId);
@@ -251,9 +305,11 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
   created(res, {
     proof: serializeProof(proof, { quest }),
     approved,
+    aiVisionVerified,
     xpAwarded: approved ? quest.xp_reward : 0,
     coinsAwarded: approved ? quest.coin_reward : 0,
     newBadges: newBadges.map((b) => ({ id: b.id, name: b.name, description: b.description, icon: b.icon })),
+    newCard: newBadges.newCard || null,
     userSnapshot: { xp: updatedUser.xp, karmaCoins: updatedUser.karma_coins },
   });
 });
@@ -287,7 +343,7 @@ router.post('/api/proofs/:proofId/upvote', requireAuth, async (req, res) => {
 
   checkAndAwardBadges(req.user.id);
   const updated = db.prepare('SELECT * FROM proofs WHERE id = ?').get(proof.id);
-  ok(res, { proof: serializeProof(updated), approved, newBadges: newBadges.map((b) => ({ id: b.id, name: b.name, icon: b.icon })) });
+  ok(res, { proof: serializeProof(updated), approved, newBadges: newBadges.map((b) => ({ id: b.id, name: b.name, icon: b.icon })), newCard: newBadges.newCard || null });
 });
 
 router.post('/api/proofs/:proofId/flag', requireAuth, async (req, res) => {

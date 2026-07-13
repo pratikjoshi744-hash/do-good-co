@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { Router } from '../lib/http.js';
 import { ok, readJsonBody, HttpError } from '../lib/http.js';
 import { db } from '../db/connection.js';
-import { serializeProof } from '../lib/serialize.js';
+import { serializeProof, serializeCashoutRequest } from '../lib/serialize.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
 import { awardForApprovedProof } from '../lib/gamification.js';
 
@@ -93,6 +94,59 @@ router.post('/api/moderation/:proofId/reject', requireAuth, requireAdmin, async 
   db.prepare('UPDATE users SET trust_score = MAX(0, trust_score - 8) WHERE id = ?').run(proof.user_id);
 
   ok(res, { proof: serializeProof(db.prepare('SELECT * FROM proofs WHERE id = ?').get(proof.id)), reason: body.reason ?? null });
+});
+
+// --- Cashout payout queue ---------------------------------------------------
+// The admin side of the request/ledger/manual-disbursement flow in
+// routes/wallet.js. "Approve" just marks the request as cleared for
+// disbursement; "Mark Paid" is a separate step logged only after the admin
+// has actually sent the UPI transfer themselves, outside this app — the
+// software never initiates a real money movement.
+
+router.get('/api/moderation/cashout-requests', requireAuth, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT c.*, u.name as user_name, u.avatar as user_avatar
+    FROM cashout_requests c JOIN users u ON u.id = c.user_id
+    ORDER BY CASE WHEN c.status = 'pending' THEN 0 WHEN c.status = 'approved' THEN 1 ELSE 2 END, c.requested_at ASC
+  `).all();
+  ok(res, rows.map((c) => ({
+    ...serializeCashoutRequest(c),
+    user: { id: c.user_id, name: c.user_name, avatar: c.user_avatar },
+  })));
+});
+
+router.post('/api/moderation/cashout-requests/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  const reqRow = db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(req.params.id);
+  if (!reqRow) throw new HttpError(404, 'Cashout request not found');
+  if (reqRow.status !== 'pending') throw new HttpError(400, 'Only a pending request can be approved');
+  db.prepare(`UPDATE cashout_requests SET status = 'approved', processed_at = datetime('now') WHERE id = ?`).run(reqRow.id);
+  ok(res, serializeCashoutRequest(db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(reqRow.id)));
+});
+
+router.post('/api/moderation/cashout-requests/:id/mark-paid', requireAuth, requireAdmin, async (req, res) => {
+  const reqRow = db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(req.params.id);
+  if (!reqRow) throw new HttpError(404, 'Cashout request not found');
+  if (!['pending', 'approved'].includes(reqRow.status)) throw new HttpError(400, 'This request is not awaiting payout');
+  db.prepare(`UPDATE cashout_requests SET status = 'paid', processed_at = datetime('now') WHERE id = ?`).run(reqRow.id);
+  ok(res, serializeCashoutRequest(db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(reqRow.id)));
+});
+
+router.post('/api/moderation/cashout-requests/:id/reject', requireAuth, requireAdmin, async (req, res) => {
+  const reqRow = db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(req.params.id);
+  if (!reqRow) throw new HttpError(404, 'Cashout request not found');
+  if (!['pending', 'approved'].includes(reqRow.status)) throw new HttpError(400, 'This request is already resolved');
+  const body = await readJsonBody(req).catch(() => ({}));
+
+  // Refund the held coins.
+  db.prepare('UPDATE users SET karma_coins = karma_coins + ? WHERE id = ?').run(reqRow.coins, reqRow.user_id);
+  db.prepare(`
+    INSERT INTO wallet_transactions (id, user_id, direction, amount, description, status)
+    VALUES (?, ?, 'earn', ?, 'Cashout request rejected — coins refunded', 'completed')
+  `).run(randomUUID(), reqRow.user_id, reqRow.coins);
+  db.prepare(`UPDATE cashout_requests SET status = 'rejected', admin_note = ?, processed_at = datetime('now') WHERE id = ?`)
+    .run((body?.reason || '').trim() || null, reqRow.id);
+
+  ok(res, serializeCashoutRequest(db.prepare('SELECT * FROM cashout_requests WHERE id = ?').get(reqRow.id)));
 });
 
 export default router;
