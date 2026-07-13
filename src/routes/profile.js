@@ -89,6 +89,15 @@ router.patch('/api/profile/me', requireAuth, async (req, res) => {
     const bio = String(body.bio).slice(0, 150);
     db.prepare('UPDATE users SET bio = ? WHERE id = ?').run(bio, req.user.id);
   }
+  // Skills power the AI concierge's quest matching and the institution
+  // member directory — stored the same comma-separated-TEXT way as
+  // quests.skill_tags so the two columns can be compared directly.
+  if (body.skills !== undefined) {
+    const skills = Array.isArray(body.skills)
+      ? body.skills.map((s) => String(s).trim().toLowerCase()).filter(Boolean).slice(0, 8)
+      : [];
+    db.prepare('UPDATE users SET skills = ? WHERE id = ?').run(skills.join(','), req.user.id);
+  }
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   ok(res, buildProfile(updated, req.user.id));
 });

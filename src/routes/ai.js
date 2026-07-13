@@ -2,6 +2,7 @@ import { Router } from '../lib/http.js';
 import { ok, readJsonBody, HttpError } from '../lib/http.js';
 import { db } from '../db/connection.js';
 import { requireAuth } from '../middleware/auth.js';
+import { serializeQuest } from '../lib/serialize.js';
 
 const router = new Router();
 
@@ -139,6 +140,71 @@ router.get('/api/ai/ngo-impact-report/:ngoId', requireAuth, (req, res) => {
   ].filter(Boolean);
 
   ok(res, { report: lines.join('\n'), source: 'heuristic' });
+});
+
+// Concierge — "top 3 for you right now," built from real signals rather
+// than free text: skill overlap with the user's declared skills, category
+// affinity from past approved proofs (same signal /api/quests already
+// boosts by), and a lightweight "almost done" nudge for daily/weekly quests
+// close to their reset. Each pick carries a plain-language "why" built from
+// whichever signal actually fired, so the UI can show its reasoning instead
+// of a black-box recommendation. Swappable later for a real model call
+// without changing the response shape.
+router.get('/api/ai/concierge', requireAuth, (req, res) => {
+  const userId = req.user.id;
+  const mySkills = (req.user.skills || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+  const affinityRows = db.prepare(`
+    SELECT q.category_id as category_id, c.name as category_name, COUNT(*) as n
+    FROM proofs p JOIN quests q ON q.id = p.quest_id JOIN categories c ON c.id = q.category_id
+    WHERE p.user_id = ? AND p.status = 'approved'
+    GROUP BY q.category_id
+  `).all(userId);
+  const affinity = new Map(affinityRows.map((r) => [r.category_id, r]));
+
+  const doneQuestIds = new Set(
+    db.prepare(`SELECT quest_id FROM proofs WHERE user_id = ? AND status IN ('approved', 'pending')`).all(userId)
+      .map((r) => r.quest_id)
+  );
+
+  const candidates = db.prepare(`
+    SELECT q.*, c.name as category_name, c.icon as category_icon
+    FROM quests q JOIN categories c ON c.id = q.category_id
+    WHERE q.status = 'active'
+  `).all().filter((q) => !doneQuestIds.has(q.id));
+
+  const scored = candidates.map((q) => {
+    const tags = (q.skill_tags || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const matchedSkills = tags.filter((t) => mySkills.includes(t));
+    const catAffinity = affinity.get(q.category_id);
+
+    let score = 0;
+    const reasons = [];
+
+    if (matchedSkills.length > 0) {
+      score += matchedSkills.length * 40;
+      reasons.push(`Matches your skill${matchedSkills.length === 1 ? '' : 's'} in ${matchedSkills.join(', ')}`);
+    }
+    if (catAffinity) {
+      score += Math.min(30, catAffinity.n * 5);
+      reasons.push(`You've done ${catAffinity.n} ${catAffinity.category_name} deed${catAffinity.n === 1 ? '' : 's'} before`);
+    }
+    if (q.ngo_featured) { score += 15; reasons.push('Featured by an NGO partner'); }
+    if (q.is_sponsored) { score += 8; }
+    if (q.type === 'daily') { score += 5; reasons.push('Quick daily quest'); }
+
+    if (reasons.length === 0) reasons.push(`Popular in ${q.category_name}`);
+
+    return { q, score, reason: reasons[0] };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, 3).map(({ q, reason }) => ({
+    ...serializeQuest(q, { id: q.category_id, name: q.category_name, icon: q.category_icon }),
+    why: reason,
+  }));
+
+  ok(res, { recommendations: top, source: 'heuristic' });
 });
 
 export default router;

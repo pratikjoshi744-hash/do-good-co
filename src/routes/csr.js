@@ -24,6 +24,19 @@ router.get('/api/csr/company', requireAuth, requireCsrAdmin, (req, res) => {
   ok(res, serializeCompany(getCompanyOr404(req.user.company_id)));
 });
 
+// Sets the CSR matching rate (₹/hour of verified employee volunteering).
+// Every approved deed an employee logs from here on writes a csr_matches
+// ledger row for real-time, per-deed, auditable matching — not a lump-sum
+// month-end guess.
+router.patch('/api/csr/company', requireAuth, requireCsrAdmin, async (req, res) => {
+  const body = await readJsonBody(req);
+  if (body.matchingRateRupeesPerHour !== undefined) {
+    const rupees = Math.max(0, Math.round(Number(body.matchingRateRupeesPerHour) || 0));
+    db.prepare('UPDATE companies SET matching_rate_paise_per_hour = ? WHERE id = ?').run(rupees * 100, req.user.company_id);
+  }
+  ok(res, serializeCompany(getCompanyOr404(req.user.company_id)));
+});
+
 // Dashboard summary: sponsored quest count, employees engaged, deeds completed,
 // XP/coins contributed, and a rough "CSR value delivered" estimate.
 router.get('/api/csr/dashboard', requireAuth, requireCsrAdmin, (req, res) => {
@@ -49,6 +62,15 @@ router.get('/api/csr/dashboard', requireAuth, requireCsrAdmin, (req, res) => {
     SELECT COUNT(*) as total_employees FROM users WHERE company_id = ?
   `).get(companyId);
 
+  // Matching is deliberately counted separately from the sponsored-quest
+  // stats above — it covers *any* verified deed an employee does, not just
+  // quests the company posted, so it needs its own totals.
+  const matchStats = db.prepare(`
+    SELECT COUNT(*) as matched_deeds, COUNT(DISTINCT user_id) as matched_employees,
+           COALESCE(SUM(amount_paise), 0) as total_matched_paise, COALESCE(SUM(minutes), 0) as total_matched_minutes
+    FROM csr_matches WHERE company_id = ?
+  `).get(companyId);
+
   ok(res, {
     company: serializeCompany(company),
     activeSponsoredQuests: questStats.active_quests,
@@ -61,6 +83,73 @@ router.get('/api/csr/dashboard', requireAuth, requireCsrAdmin, (req, res) => {
     budgetUtilizedPct: company.monthly_budget_coins
       ? Math.min(100, Math.round((completionStats.total_coins / company.monthly_budget_coins) * 100))
       : 0,
+    matching: {
+      isActive: !!company.matching_rate_paise_per_hour,
+      ratePaisePerHour: company.matching_rate_paise_per_hour,
+      matchedDeeds: matchStats.matched_deeds,
+      matchedEmployees: matchStats.matched_employees,
+      matchedHours: Math.round((matchStats.total_matched_minutes / 60) * 10) / 10,
+      totalMatchedRupees: Math.round(matchStats.total_matched_paise / 100),
+    },
+  });
+});
+
+// Recent matching ledger entries — the per-deed audit trail behind the
+// dashboard's matching totals.
+router.get('/api/csr/matches', requireAuth, requireCsrAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT m.*, u.name as user_name, u.avatar as user_avatar, q.title as quest_title
+    FROM csr_matches m
+    JOIN users u ON u.id = m.user_id
+    JOIN quests q ON q.id = m.quest_id
+    WHERE m.company_id = ?
+    ORDER BY m.created_at DESC LIMIT 100
+  `).all(req.user.company_id);
+
+  ok(res, rows.map((m) => ({
+    id: m.id,
+    user: { id: m.user_id, name: m.user_name, avatar: m.user_avatar },
+    questTitle: m.quest_title,
+    minutes: m.minutes,
+    amountRupees: Math.round(m.amount_paise / 100),
+    createdAt: m.created_at,
+  })));
+});
+
+// Compliance report — per-employee rollup of matched hours and rupees, the
+// artifact a CSR/ESG team hands to auditors or a board committee. Mirrors
+// the shape of the NGO impact report and institution hours report (same
+// "generated from real ledger rows, not estimates" framing).
+router.get('/api/csr/compliance-report', requireAuth, requireCsrAdmin, (req, res) => {
+  const companyId = req.user.company_id;
+  const company = getCompanyOr404(companyId);
+
+  const perEmployee = db.prepare(`
+    SELECT u.id, u.name, u.avatar, COUNT(m.id) as deeds, COALESCE(SUM(m.minutes), 0) as minutes, COALESCE(SUM(m.amount_paise), 0) as amount_paise
+    FROM csr_matches m JOIN users u ON u.id = m.user_id
+    WHERE m.company_id = ?
+    GROUP BY u.id ORDER BY amount_paise DESC
+  `).all(companyId);
+
+  const totals = db.prepare(`
+    SELECT COUNT(*) as deeds, COALESCE(SUM(minutes), 0) as minutes, COALESCE(SUM(amount_paise), 0) as amount_paise
+    FROM csr_matches WHERE company_id = ?
+  `).get(companyId);
+
+  ok(res, {
+    company: serializeCompany(company),
+    generatedAt: new Date().toISOString(),
+    totals: {
+      deeds: totals.deeds,
+      hours: Math.round((totals.minutes / 60) * 10) / 10,
+      matchedRupees: Math.round(totals.amount_paise / 100),
+    },
+    employees: perEmployee.map((e) => ({
+      id: e.id, name: e.name, avatar: e.avatar,
+      deeds: e.deeds,
+      hours: Math.round((e.minutes / 60) * 10) / 10,
+      matchedRupees: Math.round(e.amount_paise / 100),
+    })),
   });
 });
 

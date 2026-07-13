@@ -2,13 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { Router } from '../lib/http.js';
 import { ok, created, readJsonBody, HttpError } from '../lib/http.js';
 import { db } from '../db/connection.js';
-import { serializeQuest, serializeProof, serializeComment } from '../lib/serialize.js';
+import { serializeQuest, serializeProof, serializeComment, serializeWitnessRequest } from '../lib/serialize.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getSessionUser } from '../middleware/auth.js';
-import { awardForApprovedProof, checkAndAwardBadges } from '../lib/gamification.js';
+import { awardForApprovedProof, checkAndAwardBadges, adjustTrustScore, upvoteThresholdFor } from '../lib/gamification.js';
 
 const router = new Router();
-const UPVOTE_THRESHOLD = 5;
 const FLAG_THRESHOLD = 3;
 
 function getQuestOr404(id) {
@@ -29,12 +28,15 @@ function getCategory(id) {
 // "smart stand-in" for a real recommender — same shape, swappable later for
 // an actual model without touching the client.
 router.get('/api/quests', (req, res) => {
-  const { category, type, search } = req.query;
+  const { category, type, search, skill } = req.query;
   let sql = `SELECT q.*, c.slug as category_slug FROM quests q JOIN categories c ON c.id = q.category_id WHERE q.status = 'active'`;
   const params = [];
   if (category) { sql += ' AND c.slug = ?'; params.push(category); }
   if (type) { sql += ' AND q.type = ?'; params.push(type); }
   if (search) { sql += ' AND (q.title LIKE ? OR q.description LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+  // skill_tags is a comma-separated TEXT column (no join table) — match with
+  // wrapped-comma LIKE so "art" doesn't false-match "part-time" etc.
+  if (skill) { sql += " AND (',' || q.skill_tags || ',') LIKE ?"; params.push(`%,${skill},%`); }
   const rows = db.prepare(sql).all(...params);
 
   const user = getSessionUser(req);
@@ -219,10 +221,13 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
   // that's the whole point of the "reviewed by a verified NGO partner" claim
   // shown on the quest detail screen, not just a cosmetic badge.
   const needsRealReview = !!aiFlagReason || !!quest.ngo_featured;
+  // Trusted users need fewer corroborating upvotes to clear the fast track —
+  // see upvoteThresholdFor in lib/gamification.js.
+  const upvoteThreshold = upvoteThresholdFor(req.user.trust_score);
   if (!needsRealReview) {
     const simulatedUpvoters = db.prepare(`
       SELECT id FROM users WHERE id != ? ORDER BY RANDOM() LIMIT ?
-    `).all(req.user.id, UPVOTE_THRESHOLD);
+    `).all(req.user.id, upvoteThreshold);
 
     const insertUpvote = db.prepare('INSERT OR IGNORE INTO upvotes (id, proof_id, user_id) VALUES (?, ?, ?)');
     simulatedUpvoters.forEach((u) => insertUpvote.run(randomUUID(), proofId, u.id));
@@ -233,8 +238,9 @@ router.post('/api/quests/:id/proofs', requireAuth, async (req, res) => {
 
   let newBadges = [];
   let approved = false;
-  if (!needsRealReview && upvoteCount >= UPVOTE_THRESHOLD) {
+  if (!needsRealReview && upvoteCount >= upvoteThreshold) {
     db.prepare(`UPDATE proofs SET status = 'approved', reviewed_at = datetime('now'), reviewed_by = 'community' WHERE id = ?`).run(proofId);
+    adjustTrustScore(req.user.id, 2);
     newBadges = awardForApprovedProof(req.user, quest, proofId);
     approved = true;
   }
@@ -270,9 +276,11 @@ router.post('/api/proofs/:proofId/upvote', requireAuth, async (req, res) => {
   let newBadges = [];
   const quest = db.prepare('SELECT * FROM quests WHERE id = ?').get(proof.quest_id);
   const needsRealReview = !!proof.ai_flag_reason || !!quest.ngo_featured;
-  if (proof.status === 'pending' && !needsRealReview && upvoteCount >= UPVOTE_THRESHOLD) {
+  const proofOwner = db.prepare('SELECT * FROM users WHERE id = ?').get(proof.user_id);
+  const upvoteThreshold = upvoteThresholdFor(proofOwner.trust_score);
+  if (proof.status === 'pending' && !needsRealReview && upvoteCount >= upvoteThreshold) {
     db.prepare(`UPDATE proofs SET status = 'approved', reviewed_at = datetime('now'), reviewed_by = 'community' WHERE id = ?`).run(proof.id);
-    const proofOwner = db.prepare('SELECT * FROM users WHERE id = ?').get(proof.user_id);
+    adjustTrustScore(proofOwner.id, 2);
     newBadges = awardForApprovedProof(proofOwner, quest, proof.id);
     approved = true;
   }
@@ -298,6 +306,7 @@ router.post('/api/proofs/:proofId/flag', requireAuth, async (req, res) => {
   let status = proof.status;
   if (flagCount >= FLAG_THRESHOLD && status !== 'approved') {
     status = 'flagged';
+    adjustTrustScore(proof.user_id, -4);
   }
   db.prepare('UPDATE proofs SET flag_count = ?, status = ? WHERE id = ?').run(flagCount, status, proof.id);
 
@@ -330,6 +339,118 @@ router.post('/api/proofs/:proofId/comments', requireAuth, async (req, res) => {
 
   const comment = db.prepare('SELECT * FROM comments WHERE id = ?').get(id);
   created(res, serializeComment(comment, { id: req.user.id, name: req.user.name, avatar: req.user.avatar }));
+});
+
+// --- Peer-witness verification (the anti-AI-fraud countermeasure) --------
+//
+// A proof owner can open their own pending proof for witnessing. Any other
+// user browsing "witness requests near me" can claim the open slot and
+// confirm they actually saw the deed happen. Confirming pays the witness a
+// small reward for the civic labor of verifying someone else, and moves the
+// proof owner's trust score more than an algorithmic pass ever could — a
+// real second human vouching is a much harder thing to fake at scale than a
+// generated photo.
+
+const WITNESS_REWARD_COINS = 5;
+const WITNESS_TRUST_BONUS = 6;
+
+router.post('/api/proofs/:proofId/witness-request', requireAuth, async (req, res) => {
+  const proof = db.prepare('SELECT * FROM proofs WHERE id = ?').get(req.params.proofId);
+  if (!proof) throw new HttpError(404, 'Proof not found');
+  if (proof.user_id !== req.user.id) throw new HttpError(403, 'Only the proof owner can request a witness for it');
+  if (proof.status !== 'pending') throw new HttpError(400, 'Only a proof still awaiting review can be opened for witnessing');
+
+  const existing = db.prepare(`SELECT id FROM proof_witnesses WHERE proof_id = ? AND status = 'open'`).get(proof.id);
+  if (existing) throw new HttpError(409, 'This proof already has an open witness request');
+
+  const body = await readJsonBody(req).catch(() => ({}));
+  const id = randomUUID();
+  db.prepare(`
+    INSERT INTO proof_witnesses (id, proof_id, requester_id, status, note, reward_coins)
+    VALUES (?, ?, ?, 'open', ?, ?)
+  `).run(id, proof.id, req.user.id, (body?.note || '').trim() || null, WITNESS_REWARD_COINS);
+
+  const row = db.prepare('SELECT * FROM proof_witnesses WHERE id = ?').get(id);
+  const quest = db.prepare('SELECT * FROM quests WHERE id = ?').get(proof.quest_id);
+  created(res, serializeWitnessRequest(row, { quest, requester: req.user }));
+});
+
+// Open witness requests near the current user — "near" is approximated by
+// same mohalla first (real proximity, same as the rest of this build's GPS
+// story), falling back to city-wide if the mohalla has nothing open, so a
+// witness marketplace never looks empty in a smaller demo dataset.
+router.get('/api/witness-requests/nearby', requireAuth, (req, res) => {
+  const localRows = db.prepare(`
+    SELECT w.*, p.quest_id, p.caption, p.media_type, p.media_data, u.name as requester_name, u.avatar as requester_avatar, u.mohalla as requester_mohalla
+    FROM proof_witnesses w
+    JOIN proofs p ON p.id = w.proof_id
+    JOIN users u ON u.id = w.requester_id
+    WHERE w.status = 'open' AND w.requester_id != ? AND u.mohalla = ?
+    ORDER BY w.requested_at ASC LIMIT 20
+  `).all(req.user.id, req.user.mohalla);
+
+  const rows = localRows.length ? localRows : db.prepare(`
+    SELECT w.*, p.quest_id, p.caption, p.media_type, p.media_data, u.name as requester_name, u.avatar as requester_avatar, u.mohalla as requester_mohalla
+    FROM proof_witnesses w
+    JOIN proofs p ON p.id = w.proof_id
+    JOIN users u ON u.id = w.requester_id
+    WHERE w.status = 'open' AND w.requester_id != ?
+    ORDER BY w.requested_at ASC LIMIT 20
+  `).all(req.user.id);
+
+  ok(res, rows.map((w) => {
+    const quest = db.prepare('SELECT id, title FROM quests WHERE id = ?').get(w.quest_id);
+    return {
+      ...serializeWitnessRequest(w, { quest, requester: { id: w.requester_id, name: w.requester_name, avatar: w.requester_avatar, mohalla: w.requester_mohalla } }),
+      proofCaption: w.caption,
+      proofMediaType: w.media_type,
+      proofMediaData: w.media_data,
+    };
+  }));
+});
+
+router.post('/api/witness-requests/:id/confirm', requireAuth, async (req, res) => {
+  const request = db.prepare('SELECT * FROM proof_witnesses WHERE id = ?').get(req.params.id);
+  if (!request) throw new HttpError(404, 'Witness request not found');
+  if (request.status !== 'open') throw new HttpError(400, 'This witness request is no longer open');
+  if (request.requester_id === req.user.id) throw new HttpError(400, 'You cannot witness your own proof');
+
+  db.prepare(`
+    UPDATE proof_witnesses SET status = 'confirmed', witness_id = ?, confirmed_at = datetime('now') WHERE id = ?
+  `).run(req.user.id, request.id);
+  db.prepare('UPDATE proofs SET witness_count = witness_count + 1 WHERE id = ?').run(request.proof_id);
+
+  // Pay the witness for the civic labor of verifying someone else's deed.
+  db.prepare('UPDATE users SET karma_coins = karma_coins + ? WHERE id = ?').run(request.reward_coins, req.user.id);
+  db.prepare(`
+    INSERT INTO wallet_transactions (id, user_id, direction, amount, description, related_proof_id, redemption_option_id, status)
+    VALUES (?, ?, 'earn', ?, ?, ?, NULL, 'completed')
+  `).run(randomUUID(), req.user.id, request.reward_coins, "Witnessed a fellow citizen's deed", request.proof_id);
+
+  // A real, physically-present second human confirming it happened moves
+  // trust further than an algorithmic pass — see WITNESS_TRUST_BONUS above.
+  adjustTrustScore(request.requester_id, WITNESS_TRUST_BONUS);
+  checkAndAwardBadges(req.user.id);
+
+  const updated = db.prepare('SELECT * FROM proof_witnesses WHERE id = ?').get(request.id);
+  const proof = db.prepare('SELECT * FROM proofs WHERE id = ?').get(request.proof_id);
+  ok(res, {
+    request: serializeWitnessRequest(updated, { witness: req.user }),
+    proof: serializeProof(proof),
+    coinsEarned: request.reward_coins,
+  });
+});
+
+// So a proof's own detail screen can show "witness requested, waiting..."
+// or "confirmed by X" without a separate lookup.
+router.get('/api/proofs/:proofId/witness-request', requireAuth, (req, res) => {
+  const row = db.prepare(`
+    SELECT w.*, u.name as witness_name, u.avatar as witness_avatar
+    FROM proof_witnesses w LEFT JOIN users u ON u.id = w.witness_id
+    WHERE w.proof_id = ? ORDER BY w.requested_at DESC LIMIT 1
+  `).get(req.params.proofId);
+  if (!row) return ok(res, null);
+  ok(res, serializeWitnessRequest(row, { witness: row.witness_id ? { id: row.witness_id, name: row.witness_name, avatar: row.witness_avatar } : null }));
 });
 
 export default router;
