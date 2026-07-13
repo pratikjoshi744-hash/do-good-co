@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { URL } from 'node:url';
-import { seedIfEmpty, backfillMissingMedia, backfillReferralCodes, regenerateMediaIfStale } from './db/seed.js';
+import { seedIfEmpty, backfillMissingMedia, backfillReferralCodes, regenerateMediaIfStale, backfillSkillTags } from './db/seed.js';
 import { Router, ok, fail } from './lib/http.js';
 
 import authRoutes from './routes/auth.js';
@@ -25,6 +25,9 @@ import socialRoutes from './routes/social.js';
 import campaignRoutes from './routes/campaigns.js';
 import paymentRoutes from './routes/payments.js';
 import aiRoutes from './routes/ai.js';
+import institutionRoutes from './routes/institutions.js';
+import passportRoutes from './routes/passport.js';
+import shareRoutes from './routes/share.js';
 
 const PORT = process.env.PORT || 4000;
 
@@ -66,8 +69,13 @@ if (referralBackfill.backfilled > 0) {
   console.log(`Backfilled referral codes onto ${referralBackfill.backfilled} existing user(s).`);
 }
 
+const skillTagBackfill = backfillSkillTags();
+if (skillTagBackfill.backfilled > 0) {
+  console.log(`Backfilled skill tags onto ${skillTagBackfill.backfilled} existing quest(s).`);
+}
+
 const router = new Router();
-[authRoutes, categoryRoutes, questRoutes, leaderboardRoutes, walletRoutes, profileRoutes, moderationRoutes, csrRoutes, ngoRoutes, messageRoutes, townRoutes, mapRoutes, rivalRoutes, bossQuestRoutes, searchRoutes, inviteRoutes, karmaMatchRoutes, arcadeRoutes, socialRoutes, campaignRoutes, paymentRoutes, aiRoutes].forEach((r) => {
+[authRoutes, categoryRoutes, questRoutes, leaderboardRoutes, walletRoutes, profileRoutes, moderationRoutes, csrRoutes, ngoRoutes, messageRoutes, townRoutes, mapRoutes, rivalRoutes, bossQuestRoutes, searchRoutes, inviteRoutes, karmaMatchRoutes, arcadeRoutes, socialRoutes, campaignRoutes, paymentRoutes, aiRoutes, institutionRoutes, passportRoutes, shareRoutes].forEach((r) => {
   router.routes.push(...r.routes);
 });
 
