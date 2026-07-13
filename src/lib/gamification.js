@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/connection.js';
+import { pickWeightedCard } from '../db/seed.js';
 
 /**
  * Awards XP + Karma Coins to a user and checks for newly-earned badges.
- * Returns the list of badges newly unlocked by this action (for toast/confetti UI).
+ * Returns { badges, newCard } — newCard is set only on a milestone deed
+ * (see maybeDropKarmaCard below), for toast/confetti UI to react to.
  */
 export function awardForApprovedProof(user, quest, proofId) {
   db.prepare('UPDATE users SET xp = xp + ?, karma_coins = karma_coins + ? WHERE id = ?')
@@ -15,8 +17,30 @@ export function awardForApprovedProof(user, quest, proofId) {
   `).run(randomUUID(), user.id, quest.coin_reward, `Completed '${quest.title}'`, proofId);
 
   recordCsrMatch(user, quest, proofId);
+  const newCard = maybeDropKarmaCard(user.id);
+  const badges = checkAndAwardBadges(user.id);
+  badges.newCard = newCard;
+  return badges;
+}
 
-  return checkAndAwardBadges(user.id);
+/**
+ * Karma Cards — a collectible drop on every 5th approved deed (5, 10, 15…),
+ * weighted by rarity (see pickWeightedCard in db/seed.js). Milestone-gated
+ * rather than every deed so a card actually feels earned, and duplicates are
+ * allowed (a real collectible-card mechanic — dupes are part of the game,
+ * not a bug) since gifting a duplicate to a friend is itself a feature.
+ */
+const CARD_DROP_EVERY_N_DEEDS = 5;
+
+function maybeDropKarmaCard(userId) {
+  const approvedCount = db.prepare("SELECT COUNT(*) as c FROM proofs WHERE user_id = ? AND status = 'approved'").get(userId).c;
+  if (approvedCount === 0 || approvedCount % CARD_DROP_EVERY_N_DEEDS !== 0) return null;
+
+  const card = pickWeightedCard();
+  if (!card) return null;
+
+  db.prepare('INSERT INTO user_cards (id, user_id, card_id) VALUES (?, ?, ?)').run(randomUUID(), userId, card.id);
+  return { id: card.id, name: card.name, rarity: card.rarity, art: card.art, color: card.color, description: card.description };
 }
 
 /**

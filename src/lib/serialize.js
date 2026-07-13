@@ -133,6 +133,8 @@ export function serializeProof(proof, { quest, user } = {}) {
     commentCount: proof.comment_count ?? 0,
     aiDuplicateFlag: !!proof.ai_duplicate_flag,
     aiFlagReason: proof.ai_flag_reason || null,
+    aiVisionScore: proof.ai_vision_score ?? null,
+    voiceNoteData: proof.voice_note_data || null,
     distanceMeters: proof.distance_meters ?? null,
     ngoVerified: !!proof.ngo_verified,
     witnessCount: proof.witness_count ?? 0,
@@ -216,6 +218,31 @@ export function serializeInstitution(i, { memberCount, isAdmin } = {}) {
     memberCount: memberCount ?? undefined,
     isAdmin: isAdmin ?? undefined,
     createdAt: i.created_at,
+  };
+}
+
+export function serializeCashoutRequest(c) {
+  return {
+    id: c.id,
+    coins: c.coins,
+    amountRupees: Math.round(c.amount_paise / 100),
+    upiId: c.upi_id,
+    status: c.status,
+    adminNote: c.admin_note || null,
+    requestedAt: c.requested_at,
+    processedAt: c.processed_at,
+  };
+}
+
+export function serializeKarmaCard(card, extra = {}) {
+  return {
+    id: card.id,
+    name: card.name,
+    rarity: card.rarity,
+    art: card.art,
+    description: card.description,
+    color: card.color,
+    ...extra,
   };
 }
 
