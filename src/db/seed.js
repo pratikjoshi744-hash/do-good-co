@@ -1008,3 +1008,36 @@ export function backfillReferralCodes() {
   }
   return { backfilled: missing.length };
 }
+
+// Skill tags per category — a rough, hand-picked mapping (not user input)
+// so every seeded quest is filterable/matchable by real-world skill without
+// having to hand-tag ~150 individual quest rows. A quest owner (NGO/CSR) can
+// override this later per-quest; this just gives the whole catalog a
+// sensible default so the AI concierge and skill filter have something to
+// work with on day one.
+const SKILL_TAGS_BY_CATEGORY_SLUG = {
+  seva: 'logistics,physical-labor',
+  prakriti: 'gardening,environmental',
+  'gyan-daan': 'teaching,mentoring',
+  swasthya: 'medical,first-aid,counseling',
+  ahimsa: 'animal-care',
+  swachh: 'physical-labor,organizing',
+  maitri: 'community-building,hospitality',
+  kala: 'art,music,performance',
+  pragati: 'tech-support,digital-literacy',
+  nagrik: 'civic-engagement,advocacy',
+};
+
+export function backfillSkillTags() {
+  initSchema();
+  const missing = db.prepare(`
+    SELECT q.id, c.slug FROM quests q JOIN categories c ON c.id = q.category_id
+    WHERE q.skill_tags IS NULL OR q.skill_tags = ''
+  `).all();
+  if (missing.length === 0) return { backfilled: 0 };
+  const update = db.prepare(`UPDATE quests SET skill_tags = @skill_tags WHERE id = @id`);
+  for (const row of missing) {
+    update.run({ id: row.id, skill_tags: SKILL_TAGS_BY_CATEGORY_SLUG[row.slug] || '' });
+  }
+  return { backfilled: missing.length };
+}

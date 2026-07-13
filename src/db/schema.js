@@ -18,6 +18,8 @@ const COLUMN_MIGRATIONS = {
     ['last_ludo_at', "TEXT"],
     ['bio', "TEXT NOT NULL DEFAULT ''"],
     ['last_obstacle_clear_at', "TEXT"],
+    ['institution_id', "TEXT REFERENCES institutions(id)"],
+    ['skills', "TEXT NOT NULL DEFAULT ''"],
   ],
   quests: [
     ['ngo_id', "TEXT REFERENCES ngos(id)"],
@@ -26,6 +28,7 @@ const COLUMN_MIGRATIONS = {
     ['proof_example_hint', "TEXT"],
     ['site_lat', "REAL"],
     ['site_lng', "REAL"],
+    ['skill_tags', "TEXT NOT NULL DEFAULT ''"],
   ],
   proofs: [
     ['media_type', "TEXT"],
@@ -35,6 +38,12 @@ const COLUMN_MIGRATIONS = {
     ['image_hash', "TEXT"],
     ['ai_flag_reason', "TEXT"],
     ['distance_meters', "REAL"],
+    ['witness_count', "INTEGER NOT NULL DEFAULT 0"],
+  ],
+  companies: [
+    // Paise matched per hour of verified volunteering by an employee — the
+    // CSR "put your money where your mouth is" lever. 0 = matching off.
+    ['matching_rate_paise_per_hour', "INTEGER NOT NULL DEFAULT 0"],
   ],
 };
 
@@ -67,6 +76,23 @@ export function initSchema() {
       industry TEXT,
       plan TEXT NOT NULL DEFAULT 'CSR Dashboard (SaaS)',
       monthly_budget_coins INTEGER NOT NULL DEFAULT 0,
+      matching_rate_paise_per_hour INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- CSR matching ledger: one row per approved deed done by an employee of
+    -- a company running matching, recording the real-rupee donation their
+    -- volunteering triggered. This is the artifact a CSR/compliance team
+    -- needs — not just "employees did N deeds" but "here is exactly what
+    -- that turned into in matched funds, per person, per deed, auditable."
+    CREATE TABLE IF NOT EXISTS csr_matches (
+      id TEXT PRIMARY KEY,
+      company_id TEXT NOT NULL REFERENCES companies(id),
+      user_id TEXT NOT NULL REFERENCES users(id),
+      proof_id TEXT NOT NULL REFERENCES proofs(id),
+      quest_id TEXT NOT NULL REFERENCES quests(id),
+      minutes INTEGER NOT NULL,
+      amount_paise INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -77,6 +103,23 @@ export function initSchema() {
       mission TEXT,
       is_premium INTEGER NOT NULL DEFAULT 0,
       verified INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Institutions: schools, colleges, corporates, and formal Housing
+    -- Society (RWA) groups. Distinct from the free-text "mohalla" field
+    -- (which is just a neighborhood label) — an institution has a real
+    -- admin, a join code, and its own leaderboard + reporting, so a school
+    -- can run an NSS-credit-hours export or a housing society can run a
+    -- formal building-vs-building competition instead of the informal
+    -- mohalla territory wars.
+    CREATE TABLE IF NOT EXISTS institutions (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'school',
+      join_code TEXT NOT NULL UNIQUE,
+      icon TEXT NOT NULL DEFAULT '🏫',
+      admin_user_id TEXT REFERENCES users(id),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -367,6 +410,26 @@ export function initSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       completed_at TEXT
     );
+
+    -- Peer-witness co-signing: the proof owner opens their pending proof for
+    -- witnessing (an "I was there / I can vouch" request), and any other
+    -- user can claim the open slot and confirm it in person. A confirmed
+    -- witness earns a small reward for the civic labor of verifying someone
+    -- else's deed, and the proof owner gets a real trust-score bump backed
+    -- by a second human, not just an algorithm — this is the actual fraud
+    -- countermeasure as AI-generated fake "good deed" photos get cheaper to
+    -- produce: a second real person physically confirming it happened.
+    CREATE TABLE IF NOT EXISTS proof_witnesses (
+      id TEXT PRIMARY KEY,
+      proof_id TEXT NOT NULL REFERENCES proofs(id) ON DELETE CASCADE,
+      requester_id TEXT NOT NULL REFERENCES users(id),
+      witness_id TEXT REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'open',
+      note TEXT,
+      reward_coins INTEGER NOT NULL DEFAULT 5,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      confirmed_at TEXT
+    );
   `);
 
   // Backfill columns onto tables that already existed before those columns
@@ -400,5 +463,12 @@ export function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_campaign_claims_user ON campaign_claims(user_id);
     CREATE INDEX IF NOT EXISTS idx_vouchers_user ON vouchers(user_id);
     CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id);
+    CREATE INDEX IF NOT EXISTS idx_proof_witnesses_proof ON proof_witnesses(proof_id);
+    CREATE INDEX IF NOT EXISTS idx_proof_witnesses_status ON proof_witnesses(status);
+    CREATE INDEX IF NOT EXISTS idx_proof_witnesses_witness ON proof_witnesses(witness_id);
+    CREATE INDEX IF NOT EXISTS idx_users_institution ON users(institution_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_institutions_join_code ON institutions(join_code);
+    CREATE INDEX IF NOT EXISTS idx_csr_matches_company ON csr_matches(company_id);
+    CREATE INDEX IF NOT EXISTS idx_csr_matches_user ON csr_matches(user_id);
   `);
 }
